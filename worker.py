@@ -249,6 +249,14 @@ async def setup_profile(profile: dict):
             del sf_pass
             if not logged_in:
                 await update_profile_session(profile["id"], valid=False, needs_mfa=True)
+                # Remove bot from pool so next attempt gets a fresh browser
+                user_id = profile["user_id"]
+                if user_id in _bot_pool:
+                    try:
+                        await _bot_pool[user_id]["bot"].close()
+                    except Exception:
+                        pass
+                    del _bot_pool[user_id]
                 log.warning("User %s: login failed, may need MFA", profile["user_id"])
                 return
         else:

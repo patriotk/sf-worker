@@ -407,11 +407,9 @@ class SalesforceBot:
     async def login(self, username: str, password: str, mfa_code: str | None = None, mfa_code_callback=None) -> bool:
         log.info("Logging in as %s", username)
 
-        # Only navigate if not already on a login/identity page
-        current_url = self.page.url.lower()
-        if "login" not in current_url:
-            await self.page.goto(self.instance_url, wait_until="domcontentloaded")
-            await asyncio.sleep(2)
+        # Always navigate fresh to the login page to avoid stale state
+        await self.page.goto(self.instance_url, wait_until="domcontentloaded")
+        await asyncio.sleep(3)
 
         # Handle identity confirmation page (username pre-filled + hidden)
         username_el = self.page.locator("#username")
@@ -427,14 +425,20 @@ class SalesforceBot:
         # Fill username if visible, otherwise it's pre-filled (identity confirmation)
         try:
             if await username_el.is_visible():
-                await username_el.fill(username)
+                await username_el.fill("")
+                await username_el.type(username, delay=50)
                 log.info("Filled username")
             else:
                 log.info("Username pre-filled (identity confirmation page)")
         except Exception:
             pass
 
-        await password_el.fill(password)
+        # Clear and type password (type() is more reliable than fill() for password fields)
+        await password_el.fill("")
+        await password_el.type(password, delay=50)
+        log.info("Filled password (%d chars)", len(password))
+
+        await asyncio.sleep(1)
 
         # Check "Remember Me"
         try:
