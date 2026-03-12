@@ -15,7 +15,7 @@ from supabase_client import (
     get_next_sending_entry, claim_entry, mark_sent, mark_failed,
     mark_retry, decrypt_entry, get_user_sf_profile, get_sf_credentials,
     update_profile_session, reset_stuck_entries, get_profiles_needing_setup,
-    save_org_layout,
+    save_org_layout, get_mfa_code,
 )
 from browser import SalesforceBot
 from mapper import map_to_salesforce
@@ -242,7 +242,10 @@ async def setup_profile(profile: dict):
 
         sf_user, sf_pass = get_sf_credentials(profile)
         if not await bot.ensure_logged_in():
-            logged_in = await bot.login(sf_user, sf_pass)
+            async def mfa_callback():
+                return await get_mfa_code(profile["id"])
+
+            logged_in = await bot.login(sf_user, sf_pass, mfa_code_callback=mfa_callback)
             del sf_pass
             if not logged_in:
                 await update_profile_session(profile["id"], valid=False, needs_mfa=True)

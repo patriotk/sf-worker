@@ -404,7 +404,7 @@ class SalesforceBot:
     # Authentication
     # ──────────────────────────────────────────────
 
-    async def login(self, username: str, password: str) -> bool:
+    async def login(self, username: str, password: str, mfa_code: str | None = None, mfa_code_callback=None) -> bool:
         log.info("Logging in as %s", username)
 
         # Only navigate if not already on a login/identity page
@@ -456,7 +456,7 @@ class SalesforceBot:
             await self._screenshot("login_failed")
             return False
 
-        mfa_result = await self._handle_mfa()
+        mfa_result = await self._handle_mfa(mfa_code=mfa_code, mfa_code_callback=mfa_code_callback)
         if mfa_result is False:
             return False
 
@@ -466,14 +466,19 @@ class SalesforceBot:
         log.info("Login successful")
         return True
 
-    async def _handle_mfa(self) -> bool | None:
-        mfa_selectors = [
-            "input#emc", "input[name='otp']", "input[name='verificationCode']",
+    async def _handle_mfa(self, mfa_code: str | None = None, mfa_code_callback=None) -> bool | None:
+        """Handle MFA verification. If mfa_code is provided, auto-enter it.
+        If mfa_code_callback is provided, poll it for a code (async callable returning str|None).
+        """
+        mfa_input_selectors = ["input#emc", "input[name='otp']", "input[name='verificationCode']"]
+        mfa_indicator_selectors = [
             "#save-device-checkbox", "button:has-text('Verify')",
             "text=Verify Your Identity", "text=Enter Verification Code",
         ]
+        all_selectors = mfa_input_selectors + mfa_indicator_selectors
+
         mfa_found = False
-        for sel in mfa_selectors:
+        for sel in all_selectors:
             try:
                 el = self.page.locator(sel)
                 if await el.count() > 0 and await el.first.is_visible():
@@ -485,10 +490,7 @@ class SalesforceBot:
         if not mfa_found:
             return None
 
-        log.info("=" * 60)
-        log.info("MFA DETECTED -- Complete it in the browser window")
-        log.info("Check 'Don't ask again' / 'Trust this browser'")
-        log.info("=" * 60)
+        log.info("MFA DETECTED -- looking for verification code")
 
         # Auto-check trust checkboxes
         for sel in ["#save-device-checkbox", "input[name='rememberDevice']",
@@ -503,8 +505,46 @@ class SalesforceBot:
             except Exception:
                 continue
 
-        # Wait up to 5 minutes for MFA
-        for i in range(60):
+        # Try to auto-enter MFA code
+        code = mfa_code
+        for i in range(60):  # Poll up to 5 minutes
+            if not code and mfa_code_callback:
+                code = await mfa_code_callback()
+
+            if code:
+                log.info("Got MFA code, entering it...")
+                for sel in mfa_input_selectors:
+                    try:
+                        inp = self.page.locator(sel)
+                        if await inp.count() > 0 and await inp.first.is_visible():
+                            await inp.first.fill(code)
+                            log.info("Filled MFA code into %s", sel)
+                            break
+                    except Exception:
+                        continue
+
+                # Click verify button
+                for btn_sel in ["button:has-text('Verify')", "input[type='submit']",
+                                "button#save", "input#save"]:
+                    try:
+                        btn = self.page.locator(btn_sel)
+                        if await btn.count() > 0 and await btn.first.is_visible():
+                            await btn.first.click()
+                            log.info("Clicked verify button")
+                            break
+                    except Exception:
+                        continue
+
+                await asyncio.sleep(5)
+                if await self._is_on_lightning():
+                    log.info("MFA completed successfully")
+                    return True
+                if await self._is_on_login_page():
+                    log.error("MFA failed -- wrong code or redirected to login")
+                    return False
+                # Code might have been wrong, clear it to try callback again
+                code = None
+
             await asyncio.sleep(5)
             if await self._is_on_lightning():
                 log.info("MFA completed")
@@ -513,7 +553,7 @@ class SalesforceBot:
                 log.error("MFA failed -- redirected to login")
                 return False
             if i % 4 == 3:
-                log.info("Still waiting for MFA... (%ds)", (i + 1) * 5)
+                log.info("Waiting for MFA code... (%ds)", (i + 1) * 5)
 
         log.error("MFA timeout (5 minutes)")
         await self._screenshot("mfa_timeout")

@@ -155,9 +155,30 @@ async def save_org_layout(profile_id: str, layout: dict):
     }).eq("id", profile_id).execute()
 
 
-async def get_profiles_needing_setup() -> list[dict]:
-    """Find profiles where org_layout is null (need initial scrape)."""
+async def get_mfa_code(profile_id: str) -> str | None:
+    """Read mfa_code from user_sf_profiles. Returns None if not set."""
     result = (
+        _get_client()
+        .table("user_sf_profiles")
+        .select("mfa_code")
+        .eq("id", profile_id)
+        .single()
+        .execute()
+    )
+    code = result.data.get("mfa_code") if result.data else None
+    if code:
+        # Clear it after reading so it's one-time use
+        _get_client().table("user_sf_profiles").update({
+            "mfa_code": None,
+        }).eq("id", profile_id).execute()
+    return code
+
+
+async def get_profiles_needing_setup() -> list[dict]:
+    """Find profiles where org_layout is null (need initial scrape).
+    Includes profiles needing MFA if they now have an mfa_code."""
+    # Profiles that haven't been set up yet (no MFA needed)
+    result1 = (
         _get_client()
         .table("user_sf_profiles")
         .select("*")
@@ -165,7 +186,23 @@ async def get_profiles_needing_setup() -> list[dict]:
         .eq("needs_mfa", False)
         .execute()
     )
-    return result.data or []
+    # Profiles that need MFA but now have a code submitted
+    result2 = (
+        _get_client()
+        .table("user_sf_profiles")
+        .select("*")
+        .eq("needs_mfa", True)
+        .not_.is_("mfa_code", "null")
+        .execute()
+    )
+    # Combine and deduplicate
+    seen = set()
+    profiles = []
+    for p in (result1.data or []) + (result2.data or []):
+        if p["id"] not in seen:
+            seen.add(p["id"])
+            profiles.append(p)
+    return profiles
 
 
 # --- Watchdog ---
