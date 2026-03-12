@@ -1,0 +1,15 @@
+version: "3.8"
+
+services:
+  worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ${PROFILES_DIR:-./profiles}:/data/profiles
+      - ${ERRORS_DIR:-./errors}:/data/errors
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
