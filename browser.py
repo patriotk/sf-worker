@@ -1489,13 +1489,24 @@ class SalesforceBot:
     async def _ensure_lightning_page(self) -> bool:
         """After a goto, verify we're on Lightning (not redirected to login).
         Returns True if on Lightning, False if stuck on login."""
+        log.info("Current URL before scrape: %s", self.page.url)
         await asyncio.sleep(2)
         if await self._is_on_login_page():
-            log.warning("Redirected to login page during scrape, session may not be ready")
-            # Try navigating to home first to establish session
+            log.warning("Redirected to login page during scrape (URL: %s), trying home page...", self.page.url)
+            # Try the current URL's domain instead of instance_url
+            current_url = self.page.url
+            # Extract the base domain from current URL or instance_url
             base_url = self.instance_url.split("?")[0].rstrip("/")
+            # Also try waiting for any post-login redirect
+            try:
+                await self.page.wait_for_url("**/lightning/**", timeout=10000)
+                log.info("Redirected to Lightning: %s", self.page.url)
+                return True
+            except Exception:
+                pass
             await self.page.goto(f"{base_url}/lightning/page/home", wait_until="domcontentloaded")
             await asyncio.sleep(5)
+            log.info("After home navigation: %s", self.page.url)
             if await self._is_on_login_page():
                 return False
         return True
