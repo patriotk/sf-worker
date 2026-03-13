@@ -15,7 +15,7 @@ from supabase_client import (
     get_next_sending_entry, claim_entry, mark_sent, mark_failed,
     mark_retry, decrypt_entry, get_user_sf_profile, get_sf_credentials,
     update_profile_session, reset_stuck_entries, get_profiles_needing_setup,
-    save_org_layout, get_mfa_code, clear_mfa_code,
+    save_org_layout, get_mfa_code, clear_mfa_code, write_heartbeat,
 )
 from browser import SalesforceBot
 from mapper import map_to_salesforce
@@ -137,6 +137,9 @@ async def process_entry(entry: dict):
                 return
             await clear_mfa_code(profile["id"])
 
+        # Close any stale modals/dialogs before starting
+        await bot._close_any_dialog()
+
         # Resolve contact URL
         contact_url = await bot.search_and_resolve_contact(contact_name)
         if not contact_url:
@@ -210,13 +213,22 @@ async def watchdog_loop():
 
 
 async def heartbeat_loop():
-    """Write heartbeat timestamp to local file."""
+    """Write heartbeat to local file AND Supabase for remote monitoring."""
     while not _shutdown:
         try:
+            ts = datetime.utcnow().isoformat()
+            # Local file heartbeat
             with open(config.HEARTBEAT_FILE, "w") as f:
-                f.write(datetime.utcnow().isoformat())
-        except Exception:
-            pass
+                f.write(ts)
+            # Supabase heartbeat (remote monitoring)
+            active_users = list(_bot_pool.keys())
+            await write_heartbeat(
+                active_bots=len(_bot_pool),
+                active_entries=_active_count,
+                active_users=active_users,
+            )
+        except Exception as e:
+            log.warning("Heartbeat write failed: %s", e)
         await asyncio.sleep(60)
 
 
@@ -225,6 +237,38 @@ async def idle_cleanup_loop():
     while not _shutdown:
         await cleanup_idle_bots()
         await asyncio.sleep(60)
+
+
+async def session_health_loop():
+    """Periodically check session health for all active bots."""
+    while not _shutdown:
+        for user_id, entry in list(_bot_pool.items()):
+            try:
+                bot = entry["bot"]
+                health = await bot.check_session_health()
+                if not health["healthy"]:
+                    reason = health["reason"]
+                    log.warning("User %s session unhealthy: %s", user_id, reason)
+
+                    # Get profile to update session status
+                    profile = await get_user_sf_profile(user_id)
+                    if profile:
+                        needs_mfa = "session_expired" in reason
+                        await update_profile_session(
+                            profile["id"], valid=False, needs_mfa=needs_mfa
+                        )
+                        log.info("User %s: marked session invalid (reason: %s)", user_id, reason)
+
+                    # Remove from pool so next request triggers fresh login
+                    try:
+                        await bot.close()
+                    except Exception:
+                        pass
+                    del _bot_pool[user_id]
+            except Exception as e:
+                log.warning("Health check failed for user %s: %s", user_id, e)
+
+        await asyncio.sleep(300)  # Check every 5 minutes
 
 
 async def setup_loop():
@@ -311,6 +355,7 @@ async def main():
         heartbeat_loop(),
         idle_cleanup_loop(),
         setup_loop(),
+        session_health_loop(),
     )
 
 

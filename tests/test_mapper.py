@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from mapper import map_to_salesforce, build_description
+from mapper import map_to_salesforce, build_description, _resolve_activity_type
 
 
 SAMPLE_ENTRY = {
@@ -32,6 +32,7 @@ class TestMapToSalesforce:
         result = map_to_salesforce(SAMPLE_ENTRY, None)
         assert "subject" in result
         assert "description" in result
+        assert "activity_type" in result
         assert "Sales Call" in result["subject"]
         assert "General Hospital" in result["subject"]
 
@@ -39,6 +40,7 @@ class TestMapToSalesforce:
         result = map_to_salesforce(SAMPLE_ENTRY, SAMPLE_LAYOUT)
         assert "subject" in result
         assert "description" in result
+        assert "activity_type" in result
 
     def test_empty_entry(self):
         result = map_to_salesforce({
@@ -48,6 +50,43 @@ class TestMapToSalesforce:
             "meeting_date": "",
         }, None)
         assert result["subject"]
+        assert result["activity_type"] == "Call"
+
+
+class TestActivityTypeResolution:
+    def test_call_mapping(self):
+        assert _resolve_activity_type("Call", None) == "Call"
+        assert _resolve_activity_type("phone", None) == "Call"
+
+    def test_email_mapping(self):
+        assert _resolve_activity_type("Email", None) == "Email"
+        assert _resolve_activity_type("email", None) == "Email"
+
+    def test_meeting_mapping(self):
+        assert _resolve_activity_type("Meeting", None) == "Meeting"
+        assert _resolve_activity_type("demo", None) == "Meeting"
+
+    def test_lunch_dinner_mapping(self):
+        assert _resolve_activity_type("lunch", None) == "Lunch/Dinner Meeting"
+        assert _resolve_activity_type("dinner", None) == "Lunch/Dinner Meeting"
+
+    def test_business_review_mapping(self):
+        assert _resolve_activity_type("business review", None) == "Business Review"
+
+    def test_default_fallback(self):
+        assert _resolve_activity_type("", None) == "Call"
+        assert _resolve_activity_type(None, None) == "Call"
+
+    def test_with_org_layout_validation(self):
+        layout = {"log_a_call": {"subject_picklist": ["Call", "Email", "Other"]}}
+        assert _resolve_activity_type("call", layout) == "Call"
+        # "Meeting" not in picklist -> falls back to "Other"
+        assert _resolve_activity_type("meeting", layout) == "Other"
+
+    def test_case_insensitive_match(self):
+        layout = {"log_a_call": {"subject_picklist": ["call", "EMAIL", "Other"]}}
+        assert _resolve_activity_type("Call", layout) == "call"
+        assert _resolve_activity_type("email", layout) == "EMAIL"
 
 
 class TestBuildDescription:

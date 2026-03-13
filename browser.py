@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import random
 import re
 from datetime import datetime
 from playwright.async_api import async_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeout
@@ -12,6 +13,11 @@ try:
 except ImportError:
     PROFILES_DIR = "profiles"
     ERRORS_DIR = "errors"
+
+
+async def _human_delay(min_s: float = 0.5, max_s: float = 2.0):
+    """Random delay to mimic human browsing patterns."""
+    await asyncio.sleep(random.uniform(min_s, max_s))
 
 
 def _to_sf_date(date_str: str) -> str:
@@ -116,10 +122,13 @@ class SalesforceBot:
 
     async def _is_on_login_page(self) -> bool:
         url = self.page.url.lower()
-        if "login.salesforce" in url or "/login" in url:
+        if "login.salesforce" in url:
+            return True
+        # Only match /login in Salesforce URLs, not in query params
+        if ".salesforce.com/login" in url or ".force.com/login" in url:
             return True
         # Microsoft SSO pages are also login pages
-        if "login.microsoftonline.com" in url or "login.live.com" in url:
+        if self._is_ms_sso_page():
             return True
         # Also check for login form elements on the page
         try:
@@ -408,9 +417,14 @@ class SalesforceBot:
     # ──────────────────────────────────────────────
 
     def _is_ms_sso_page(self) -> bool:
-        """Check if current page is a Microsoft SSO login page."""
+        """Check if current page is a Microsoft SSO login page (personal or enterprise)."""
         url = self.page.url.lower()
-        return "login.microsoftonline.com" in url or "login.live.com" in url
+        return (
+            "login.microsoftonline.com" in url
+            or "login.live.com" in url
+            or "adfs" in url  # On-prem Active Directory Federation Services
+            or "sts." in url  # Security Token Service (enterprise SSO)
+        )
 
     async def login(self, username: str, password: str, mfa_code: str | None = None,
                     mfa_code_callback=None, verification_email: str | None = None) -> bool:
@@ -497,32 +511,85 @@ class SalesforceBot:
     async def _login_microsoft_sso(self, username: str, password: str,
                                     mfa_code_callback=None,
                                     verification_email: str | None = None) -> bool:
-        """Handle Microsoft SSO (Azure AD SAML2) login flow.
+        """Handle Microsoft SSO (Azure AD / ADFS / SAML2) login flow.
 
-        Flow: email → password → MFA option selection → verification email → 6-digit code
-        The persistent browser profile should retain the MS session after first login,
-        so subsequent logins may skip MFA entirely.
+        Handles both personal and enterprise (Azure AD) Microsoft accounts.
+        Flow: [account picker] → email → password → [MFA] → [stay signed in] → SF
+        The persistent browser profile retains the MS session after first login.
         """
         try:
-            # Step 1: Email
-            log.info("[MS SSO] Entering email...")
+            # Step 0: Handle "Pick an account" page (enterprise SSO with cached sessions)
+            try:
+                pick_account = self.page.locator(
+                    "div[data-test-id='otherTile'], "
+                    "div.table[role='button']:has-text('Use another account'), "
+                    "div#otherTileText"
+                )
+                if await pick_account.count() > 0 and await pick_account.first.is_visible():
+                    # Try to click the matching account first
+                    acct_tile = self.page.locator(f"div[data-test-id][role='button']:has-text('{username}')")
+                    if await acct_tile.count() > 0:
+                        await acct_tile.first.click()
+                        log.info("[MS SSO] Selected existing account: %s", username)
+                    else:
+                        # Click "Use another account"
+                        await pick_account.first.click()
+                        log.info("[MS SSO] Clicked 'Use another account'")
+                    await asyncio.sleep(3)
+
+                    # After picking account, may go straight to password or back to email
+                    if await self._check_ms_sso_complete():
+                        return True
+            except Exception:
+                pass
+
+            # Step 1: Email (may be skipped if account was picked above)
             email_input = self.page.locator("input[type='email'], input[name='loginfmt']")
-            await email_input.wait_for(state="visible", timeout=15000)
-            await email_input.fill(username)
-            await self.page.locator(
-                "input[type='submit'], button:has-text('Next')"
-            ).first.click()
-            await asyncio.sleep(4)
+            try:
+                await email_input.wait_for(state="visible", timeout=8000)
+                log.info("[MS SSO] Entering email...")
+                await _human_delay(0.3, 0.8)
+                await email_input.fill(username)
+                await _human_delay(0.5, 1.0)
+                await self.page.locator(
+                    "input[type='submit'], button:has-text('Next')"
+                ).first.click()
+                await asyncio.sleep(4)
+            except PlaywrightTimeout:
+                log.info("[MS SSO] No email field -- may already be past email step")
+
+            # Step 1b: Handle ADFS redirect (enterprise on-prem identity provider)
+            url_now = self.page.url.lower()
+            if "adfs" in url_now or "sts." in url_now:
+                log.info("[MS SSO] ADFS/STS page detected, looking for credentials form")
+                adfs_user = self.page.locator("input#userNameInput, input[name='UserName']")
+                adfs_pass = self.page.locator("input#passwordInput, input[name='Password']")
+                if await adfs_user.count() > 0 and await adfs_pass.count() > 0:
+                    await adfs_user.fill(username)
+                    await _human_delay(0.3, 0.8)
+                    await adfs_pass.type(password, delay=50)
+                    await _human_delay(0.3, 0.8)
+                    submit = self.page.locator("span#submitButton, input[type='submit']")
+                    if await submit.count() > 0:
+                        await submit.first.click()
+                    await asyncio.sleep(6)
+                    if await self._check_ms_sso_complete():
+                        return True
 
             # Step 2: Password
             log.info("[MS SSO] Entering password...")
             pw_input = self.page.locator("input[type='password'], input[name='passwd']")
-            await pw_input.wait_for(state="visible", timeout=15000)
-            await pw_input.type(password, delay=50)
-            await self.page.locator(
-                "input[type='submit'], button:has-text('Next'), button:has-text('Sign in')"
-            ).first.click()
-            await asyncio.sleep(6)
+            try:
+                await pw_input.wait_for(state="visible", timeout=15000)
+                await _human_delay(0.3, 0.8)
+                await pw_input.type(password, delay=50)
+                await _human_delay(0.5, 1.0)
+                await self.page.locator(
+                    "input[type='submit'], button:has-text('Next'), button:has-text('Sign in')"
+                ).first.click()
+                await asyncio.sleep(6)
+            except PlaywrightTimeout:
+                log.info("[MS SSO] No password field -- may have auto-signed in")
 
             # Check if we landed on Salesforce already (no MFA required)
             if await self._check_ms_sso_complete():
@@ -685,6 +752,20 @@ class SalesforceBot:
         """Check if Microsoft SSO flow completed and we're back on Salesforce/Office."""
         url = self.page.url.lower()
 
+        # Handle consent/permissions prompt (enterprise Azure AD conditional access)
+        try:
+            accept_btn = self.page.locator(
+                "input[value='Accept'], button:has-text('Accept'), "
+                "input[value='Consent'], button:has-text('Continue')"
+            )
+            if await accept_btn.count() > 0 and await accept_btn.first.is_visible():
+                await accept_btn.first.click()
+                log.info("[MS SSO] Accepted consent/permissions prompt")
+                await asyncio.sleep(3)
+                url = self.page.url.lower()
+        except Exception:
+            pass
+
         # Check for "Stay signed in?" prompt and click Yes
         try:
             stay_btn = self.page.locator(
@@ -696,7 +777,7 @@ class SalesforceBot:
                 try:
                     dont_show = self.page.locator(
                         "input[type='checkbox']:near(:text('Don\\'t show')), "
-                        "input#KmsOptions"
+                        "input#KmsOptions, input#KmsiCheckboxField"
                     )
                     if await dont_show.count() > 0:
                         await dont_show.first.check()
@@ -714,8 +795,16 @@ class SalesforceBot:
             log.info("[MS SSO] Login complete -- on Salesforce Lightning")
             return True
 
+        # Salesforce classic or setup page (still a success)
+        if ".salesforce.com" in url and "login" not in url:
+            log.info("[MS SSO] Login complete -- on Salesforce (classic/setup)")
+            return True
+
         # Still on MS login pages
-        if "login.microsoftonline.com" in url or "login.live.com" in url:
+        if any(x in url for x in [
+            "login.microsoftonline.com", "login.live.com",
+            "adfs", "sts.", "device.login.microsoftonline.com"
+        ]):
             return False
 
         # On Office/M365 (shouldn't happen for SF SSO, but handle it)
@@ -891,11 +980,9 @@ class SalesforceBot:
 
         async def _do():
             # Always navigate to home to get a clean Lightning page
+            await _human_delay(0.5, 1.5)
             await self.page.goto(f"{self.instance_url}/lightning/page/home", wait_until="domcontentloaded")
             await asyncio.sleep(5)
-
-            # Take debug screenshot to see page state
-            await self._screenshot("search_page_state")
 
             # Try multiple ways to find the search button
             search_btn = None
@@ -982,24 +1069,104 @@ class SalesforceBot:
     async def search_account(self, name: str) -> list[dict]:
         return await self.search_record(name, "001")
 
+    async def search_opportunity(self, name: str) -> list[dict]:
+        return await self.search_record(name, "006")
+
+    async def search_and_resolve_opportunity(self, opp_name: str) -> str | None:
+        """Search for an opportunity by name and return its URL, or None."""
+        matches = await self.search_opportunity(opp_name)
+        if not matches:
+            log.warning("Opportunity '%s' not found in Salesforce", opp_name)
+            return None
+        if len(matches) > 1:
+            log.warning("Multiple matches for '%s', using first: %s", opp_name, matches[0]["name"])
+        return matches[0]["url"]
+
+    async def check_session_health(self) -> dict:
+        """Check if session is healthy. Returns status dict for monitoring.
+
+        Returns: {"healthy": bool, "reason": str, "url": str}
+        """
+        try:
+            current_url = self.page.url
+            # If on Lightning, quick check
+            if "lightning" in current_url and "login" not in current_url.lower():
+                try:
+                    await self.page.wait_for_selector(
+                        "button:has-text('Search'), nav[aria-label='Main']", timeout=5000
+                    )
+                    return {"healthy": True, "reason": "on_lightning", "url": current_url}
+                except PlaywrightTimeout:
+                    pass
+
+            # Navigate to home to check
+            await self.page.goto(f"{self.instance_url}/lightning/page/home", wait_until="domcontentloaded")
+            await asyncio.sleep(3)
+
+            if self._is_ms_sso_page():
+                return {"healthy": False, "reason": "session_expired_ms_sso", "url": self.page.url}
+            if await self._is_on_login_page():
+                return {"healthy": False, "reason": "session_expired_sf_login", "url": self.page.url}
+
+            try:
+                await self.page.wait_for_selector(
+                    "button:has-text('Search'), nav[aria-label='Main']", timeout=15000
+                )
+                return {"healthy": True, "reason": "lightning_loaded", "url": self.page.url}
+            except PlaywrightTimeout:
+                return {"healthy": False, "reason": "lightning_timeout", "url": self.page.url}
+
+        except Exception as e:
+            return {"healthy": False, "reason": f"error: {e}", "url": ""}
+
     # ──────────────────────────────────────────────
     # LOG A CALL (proven working)
     # ──────────────────────────────────────────────
 
     async def log_call(self, contact_url: str, entry_data: dict) -> bool:
+        """Log a Call on a Contact or Opportunity record.
+
+        entry_data keys: subject, description, activity_type (optional picklist value)
+        contact_url can be a Contact URL or an Opportunity URL.
+        """
         log.info("Logging call: %s", entry_data.get("subject", "")[:60])
 
         async def _do():
+            await _human_delay(0.5, 1.5)
             await self.page.goto(contact_url, wait_until="domcontentloaded")
             await asyncio.sleep(3)
             await self._close_any_dialog()
 
-            log_btn = self.page.get_by_role("button", name="Log a Call", exact=True)
+            # Look for "Log a Call" button -- may be in activity tab or action bar
+            log_btn = None
+            for strategy, fn in [
+                ("exact button", lambda: self.page.get_by_role("button", name="Log a Call", exact=True)),
+                ("action menu", lambda: self.page.locator("a[title='Log a Call'], button[title='Log a Call']").first),
+                ("activity tab link", lambda: self.page.locator("a:has-text('Log a Call')").first),
+            ]:
+                try:
+                    el = fn()
+                    if await el.count() > 0 and await el.first.is_visible():
+                        log_btn = el.first if hasattr(el, 'first') else el
+                        log.info("Found 'Log a Call' via: %s", strategy)
+                        break
+                except Exception:
+                    continue
+
+            if not log_btn:
+                # Try scrolling down to find it in the activity section
+                await self.page.evaluate("window.scrollBy(0, 500)")
+                await asyncio.sleep(1)
+                log_btn = self.page.get_by_role("button", name="Log a Call", exact=True)
+
             await log_btn.wait_for(state="visible", timeout=20000)
+            await _human_delay(0.3, 0.8)
             await log_btn.click()
 
-            dialog = self.page.get_by_role("dialog", name="Log a Call")
-            await dialog.wait_for(state="visible", timeout=15000)
+            dialog = await self._find_visible_dialog(["Log a Call", "Log Activity", "New Task"])
+            if not dialog:
+                dialog = self.page.get_by_role("dialog", name="Log a Call")
+                await dialog.wait_for(state="visible", timeout=15000)
             await asyncio.sleep(2)
 
             # Subject
@@ -1010,12 +1177,19 @@ class SalesforceBot:
                 await asyncio.sleep(0.2)
                 await subject_el.fill(entry_data["subject"])
                 await subject_el.press("Tab")
-                await asyncio.sleep(0.5)
+                await _human_delay(0.3, 0.8)
                 log.info("Subject filled")
 
-            # Comments
+            # Type picklist (Jeff's BSci has ~50 activity types)
+            activity_type = entry_data.get("activity_type")
+            if activity_type:
+                await _human_delay(0.3, 0.6)
+                await self._select_picklist(dialog, "Type", activity_type)
+
+            # Comments / Description
             comments = await self._find_textarea(dialog)
             if comments:
+                await _human_delay(0.3, 0.8)
                 await comments.click()
                 await asyncio.sleep(0.5)
                 await comments.fill(entry_data["description"])
@@ -1033,6 +1207,7 @@ class SalesforceBot:
                     await comments.type(entry_data["description"][:3000], delay=2)
                 log.info("Comments filled")
 
+            await _human_delay(0.5, 1.0)
             return await self._click_save_and_wait(dialog)
 
         try:

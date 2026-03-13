@@ -218,6 +218,28 @@ async def get_profiles_needing_setup() -> list[dict]:
     return profiles
 
 
+# --- Heartbeat / Monitoring ---
+
+async def write_heartbeat(active_bots: int = 0, active_entries: int = 0, active_users: list = None):
+    """Write worker heartbeat to Supabase for remote monitoring.
+
+    Uses upsert on a `worker_heartbeats` table. If the table doesn't exist,
+    silently fails (monitoring is optional, not critical).
+    """
+    try:
+        _get_client().table("worker_heartbeats").upsert({
+            "worker_id": "sf-worker-hetzner",
+            "last_heartbeat": _utcnow(),
+            "active_bots": active_bots,
+            "active_entries": active_entries,
+            "active_users": active_users or [],
+            "status": "running",
+        }, on_conflict="worker_id").execute()
+    except Exception as e:
+        # Table may not exist yet -- that's fine, heartbeat is optional
+        log.debug("Heartbeat write failed (table may not exist): %s", e)
+
+
 # --- Watchdog ---
 
 async def reset_stuck_entries():
