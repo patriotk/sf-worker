@@ -124,7 +124,8 @@ async def test_ms_login(email: str, password: str, mfa_code: str = None):
             email_input = page.locator("input[type='email'], input[name='loginfmt']")
             await email_input.wait_for(state="visible", timeout=10000)
             await email_input.fill(email)
-            await page.locator("input[type='submit']").click()
+            submit_btn = page.locator("input[type='submit'], button[type='submit'], button:has-text('Next'), button:has-text('Sign in')")
+            await submit_btn.first.click()
             await asyncio.sleep(3)
         except PlaywrightTimeout:
             await page.screenshot(path=f"{ERRORS_DIR}/ms_step1_no_email.png")
@@ -136,7 +137,9 @@ async def test_ms_login(email: str, password: str, mfa_code: str = None):
             pw_input = page.locator("input[type='password'], input[name='passwd']")
             await pw_input.wait_for(state="visible", timeout=10000)
             await pw_input.type(password, delay=50)
-            await page.locator("input[type='submit']").click()
+            # Microsoft uses various button types: input[type=submit], button with text Next/Sign in
+            submit_btn = page.locator("input[type='submit'], button[type='submit'], button:has-text('Next'), button:has-text('Sign in')")
+            await submit_btn.first.click()
             await asyncio.sleep(5)
         except PlaywrightTimeout:
             await page.screenshot(path=f"{ERRORS_DIR}/ms_step1_no_password.png")
