@@ -232,28 +232,104 @@ class SalesforceBot:
             log.warning("Could not fill field '%s'", label)
 
     async def _select_picklist(self, container, label: str, value: str):
-        """Select a value from a Salesforce picklist/combobox."""
+        """Select a value from a Salesforce picklist/combobox.
+
+        Tries multiple strategies for Lightning Experience picklist components:
+        1. ARIA combobox role with matching name
+        2. lightning-combobox component with matching label attribute
+        3. Label text -> sibling/descendant button with combobox role
+        """
         if not value:
             return
-        combo = container.get_by_role("combobox", name=label)
+
+        combo = None
+
+        # Strategy 1: ARIA combobox role by name (works for some picklists)
         try:
-            if await combo.count() > 0:
-                await combo.click()
-                await asyncio.sleep(0.5)
-                option = container.get_by_role("option", name=value)
-                if await option.count() > 0:
-                    await option.first.click()
-                    log.info("Selected '%s' = '%s'", label, value)
-                else:
-                    # Type it in
-                    await combo.fill(value)
-                    await combo.press("Tab")
-                    log.info("Typed '%s' = '%s' (no matching option)", label, value)
-                await asyncio.sleep(0.3)
-                return
+            el = container.get_by_role("combobox", name=label)
+            if await el.count() > 0:
+                combo = el
+                log.debug("Picklist '%s': found via combobox role", label)
         except Exception:
             pass
-        log.warning("Could not select picklist '%s' = '%s'", label, value)
+
+        # Strategy 2: lightning-combobox with label attribute
+        if not combo:
+            try:
+                lc = container.locator(f"lightning-combobox[label='{label}']")
+                if await lc.count() > 0:
+                    # The clickable button inside lightning-combobox
+                    btn = lc.locator("button").first
+                    if await btn.count() > 0:
+                        combo = btn
+                        log.debug("Picklist '%s': found via lightning-combobox[label]", label)
+            except Exception:
+                pass
+
+        # Strategy 3: lightning-grouped-combobox with label attribute
+        if not combo:
+            try:
+                lgc = container.locator(f"lightning-grouped-combobox[label='{label}']")
+                if await lgc.count() > 0:
+                    btn = lgc.locator("button, input[role='combobox']").first
+                    if await btn.count() > 0:
+                        combo = btn
+                        log.debug("Picklist '%s': found via lightning-grouped-combobox", label)
+            except Exception:
+                pass
+
+        # Strategy 4: Find label text, then navigate to its associated combobox/button
+        if not combo:
+            try:
+                lbl = container.locator(f"label:has-text('{label}')").first
+                if await lbl.count() > 0:
+                    # Get the for attribute or find sibling input/button
+                    parent = lbl.locator("..")
+                    btn = parent.locator("button[role='combobox'], input[role='combobox'], button[role='listbox']").first
+                    if await btn.count() > 0:
+                        combo = btn
+                        log.debug("Picklist '%s': found via label -> sibling combobox", label)
+            except Exception:
+                pass
+
+        if not combo:
+            log.warning("Could not find picklist '%s' in dialog", label)
+            return
+
+        try:
+            await combo.scroll_into_view_if_needed()
+            await combo.click()
+            await asyncio.sleep(0.8)
+
+            # Look for dropdown options -- try on page level since Lightning
+            # renders listbox options in a portal/overlay outside the dialog
+            option = None
+            for scope in [container, self.page]:
+                opt = scope.get_by_role("option", name=value)
+                if await opt.count() > 0:
+                    option = opt.first
+                    break
+
+            if option:
+                await option.click()
+                log.info("Selected '%s' = '%s'", label, value)
+            else:
+                # Try data-value attribute (Lightning stores picklist values here)
+                dv = self.page.locator(f"lightning-base-combobox-item[data-value='{value}']")
+                if await dv.count() > 0:
+                    await dv.first.click()
+                    log.info("Selected '%s' = '%s' via data-value", label, value)
+                else:
+                    # Last resort: type it and tab away
+                    try:
+                        await combo.fill(value)
+                    except Exception:
+                        await combo.type(value, delay=50)
+                    await combo.press("Tab")
+                    log.info("Typed '%s' = '%s' (no matching option found)", label, value)
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            log.warning("Could not select picklist '%s' = '%s': %s", label, value, e)
 
     async def _fill_lookup(self, container, label: str, value: str):
         """Fill a Salesforce lookup/combobox field and pick from dropdown or Advanced Search."""
