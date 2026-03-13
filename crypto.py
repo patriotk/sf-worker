@@ -100,5 +100,5 @@ CRM_ENTRY_FIELDS = [
     ("action_items", "list"),
     ("next_steps", "list"),
     ("opportunities", "str"),
-    ("meeting_type", "str"),
+    # meeting_type excluded: has DB check constraint, kept as plaintext
 ]
