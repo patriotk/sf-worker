@@ -501,6 +501,9 @@ class SalesforceBot:
                 lambda u: "/login" not in u.lower() and "login.salesforce" not in u.lower(),
                 timeout=30000,
             )
+            # Wait for the page to fully load and set all cookies
+            await self.page.wait_for_load_state("networkidle", timeout=15000)
+            await asyncio.sleep(3)
         except PlaywrightTimeout:
             log.error("Login timed out")
             await self._screenshot("login_failed")
@@ -510,8 +513,15 @@ class SalesforceBot:
         if mfa_result is False:
             return False
 
+        log.info("Post-login URL: %s", self.page.url)
+
+        # Try to navigate to Lightning to establish the Lightning session
         if not await self._is_on_lightning():
-            log.warning("Lightning not fully detected, continuing...")
+            log.info("Not on Lightning yet, navigating to Lightning home...")
+            base_url = self.instance_url.split("?")[0].rstrip("/")
+            await self.page.goto(f"{base_url}/lightning/page/home", wait_until="networkidle", timeout=30000)
+            await asyncio.sleep(5)
+            log.info("After Lightning navigation: %s", self.page.url)
 
         log.info("Login successful")
         return True
