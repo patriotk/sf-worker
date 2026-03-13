@@ -1540,14 +1540,22 @@ class SalesforceBot:
     # ──────────────────────────────────────────────
 
     async def _ensure_lightning_page(self) -> bool:
-        """Navigate to Lightning home and verify we're logged in.
+        """Verify we're on Lightning. Uses current page URL domain if already on Lightning.
         Returns True if on Lightning, False if stuck on login."""
-        base_url = self.instance_url.split("?")[0].rstrip("/")
-        log.info("Navigating to Lightning home before scrape (base: %s)", base_url)
+        current = self.page.url
+        # If we're already on Lightning, great
+        if "/lightning/" in current:
+            log.info("Already on Lightning: %s", current)
+            return True
+
+        # Try to navigate to Lightning using the current domain first
+        import re
+        m = re.match(r"(https://[^/]+)", current)
+        base_url = m.group(1) if m else self.instance_url.split("?")[0].rstrip("/")
+        log.info("Navigating to Lightning home (base: %s)", base_url)
         await self.page.goto(f"{base_url}/lightning/page/home", wait_until="domcontentloaded")
         await asyncio.sleep(5)
-        current_url = self.page.url
-        log.info("After Lightning home navigation: %s", current_url)
+        log.info("After navigation: %s", self.page.url)
         if await self._is_on_login_page():
             log.error("Still on login page after navigating to Lightning home")
             return False
@@ -1556,12 +1564,17 @@ class SalesforceBot:
     async def scrape_org_layout(self) -> dict:
         log.info("Scraping org layout...")
         layout = {"log_a_call": {}, "contacts": {}, "accounts": {}}
-        base_url = self.instance_url.split("?")[0].rstrip("/")
 
         # First, ensure we're actually on a Lightning page
         if not await self._ensure_lightning_page():
             log.error("Cannot scrape: not logged in to Salesforce")
             return layout
+
+        # Use current page's domain as base URL (it's the authenticated domain)
+        import re
+        m = re.match(r"(https://[^/]+)", self.page.url)
+        base_url = m.group(1) if m else self.instance_url.split("?")[0].rstrip("/")
+        log.info("Scraping using base URL: %s", base_url)
 
         # Log a Call
         try:
