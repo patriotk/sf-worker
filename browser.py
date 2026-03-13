@@ -130,11 +130,19 @@ class SalesforceBot:
         # Microsoft SSO pages are also login pages
         if self._is_ms_sso_page():
             return True
-        # Also check for login form elements on the page
+        # Check for login form elements - but only on pages that LOOK like login pages
+        # Skip the #username check on Lightning pages or the classic home page
+        if "/lightning/" in url:
+            return False
+        # On the SF root page, check for the actual login form (not just any #username)
         try:
             username_field = self.page.locator("#username")
-            if await username_field.count() > 0 and await username_field.is_visible():
-                log.info("Login page detected (found #username field)")
+            password_field = self.page.locator("#password")
+            login_btn = self.page.locator("#Login")
+            if (await username_field.count() > 0 and await username_field.is_visible()
+                    and await password_field.count() > 0 and await password_field.is_visible()
+                    and await login_btn.count() > 0):
+                log.info("Login page detected (found #username + #password + #Login)")
                 return True
         except Exception:
             pass
@@ -1487,28 +1495,17 @@ class SalesforceBot:
     # ──────────────────────────────────────────────
 
     async def _ensure_lightning_page(self) -> bool:
-        """After a goto, verify we're on Lightning (not redirected to login).
+        """Navigate to Lightning home and verify we're logged in.
         Returns True if on Lightning, False if stuck on login."""
-        log.info("Current URL before scrape: %s", self.page.url)
-        await asyncio.sleep(2)
+        base_url = self.instance_url.split("?")[0].rstrip("/")
+        log.info("Navigating to Lightning home before scrape (base: %s)", base_url)
+        await self.page.goto(f"{base_url}/lightning/page/home", wait_until="domcontentloaded")
+        await asyncio.sleep(5)
+        current_url = self.page.url
+        log.info("After Lightning home navigation: %s", current_url)
         if await self._is_on_login_page():
-            log.warning("Redirected to login page during scrape (URL: %s), trying home page...", self.page.url)
-            # Try the current URL's domain instead of instance_url
-            current_url = self.page.url
-            # Extract the base domain from current URL or instance_url
-            base_url = self.instance_url.split("?")[0].rstrip("/")
-            # Also try waiting for any post-login redirect
-            try:
-                await self.page.wait_for_url("**/lightning/**", timeout=10000)
-                log.info("Redirected to Lightning: %s", self.page.url)
-                return True
-            except Exception:
-                pass
-            await self.page.goto(f"{base_url}/lightning/page/home", wait_until="domcontentloaded")
-            await asyncio.sleep(5)
-            log.info("After home navigation: %s", self.page.url)
-            if await self._is_on_login_page():
-                return False
+            log.error("Still on login page after navigating to Lightning home")
+            return False
         return True
 
     async def scrape_org_layout(self) -> dict:
