@@ -501,20 +501,35 @@ class SalesforceBot:
         except Exception:
             pass
 
-        await self.page.click("#Login")
+        # Click login button - try multiple selectors
+        login_btn = self.page.locator("#Login")
+        if await login_btn.count() == 0:
+            # login.salesforce.com identity confirmation uses different button
+            login_btn = self.page.locator("input[type='submit'], button[type='submit']").first
+        await login_btn.click()
 
         try:
+            # Wait for redirect away from login pages
             await self.page.wait_for_url(
-                lambda u: "/login" not in u.lower() and "login.salesforce" not in u.lower(),
+                lambda u: "login.salesforce" not in u.lower() and not u.lower().endswith("/login"),
                 timeout=30000,
             )
             # Wait for the page to fully load and set all cookies
-            await self.page.wait_for_load_state("networkidle", timeout=15000)
+            try:
+                await self.page.wait_for_load_state("networkidle", timeout=15000)
+            except PlaywrightTimeout:
+                pass  # networkidle might not fire on heavy pages
             await asyncio.sleep(3)
         except PlaywrightTimeout:
-            log.error("Login timed out")
-            await self._screenshot("login_failed")
-            return False
+            # Check if we're actually on Lightning despite the timeout
+            current = self.page.url
+            log.info("URL after login wait: %s", current)
+            if "lightning" in current.lower() or ".my.salesforce.com" in current.lower():
+                log.info("Login succeeded despite URL wait timeout")
+            else:
+                log.error("Login timed out (URL: %s)", current)
+                await self._screenshot("login_failed")
+                return False
 
         mfa_result = await self._handle_mfa(mfa_code=mfa_code, mfa_code_callback=mfa_code_callback)
         if mfa_result is False:
