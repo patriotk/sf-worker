@@ -1,6 +1,8 @@
 """
-Quick test: Can Playwright get through Microsoft's login page?
-Usage: python test_microsoft_login.py <email> <password>
+Microsoft SSO login test - two-step flow:
+  Step 1: python test_microsoft_login.py <email> <password>        → sends MFA code
+  Step 2: python test_microsoft_login.py <email> <password> <code> → enters code, completes login
+Uses persistent browser profile so session survives between runs.
 """
 import asyncio
 import sys
@@ -11,10 +13,8 @@ PROFILE_DIR = "/data/profiles/ms_test"
 ERRORS_DIR = "/data/errors"
 
 
-async def test_ms_login(email: str, password: str):
-    print(f"[1] Launching browser (headless)...")
+async def test_ms_login(email: str, password: str, mfa_code: str = None):
     pw = await async_playwright().start()
-
     os.makedirs(PROFILE_DIR, exist_ok=True)
     os.makedirs(ERRORS_DIR, exist_ok=True)
 
@@ -27,93 +27,159 @@ async def test_ms_login(email: str, password: str):
     page = context.pages[0] if context.pages else await context.new_page()
 
     try:
-        # Navigate to Microsoft login
-        print(f"[2] Navigating to Microsoft login...")
+        # Check if we're already logged in from persistent profile
+        print(f"[1] Navigating to Microsoft login...")
         await page.goto("https://login.microsoftonline.com/", wait_until="domcontentloaded")
         await asyncio.sleep(3)
+        url = page.url.lower()
 
-        # Screenshot: initial page
-        await page.screenshot(path=f"{ERRORS_DIR}/ms_01_initial.png")
-        print(f"[3] Screenshot saved: ms_01_initial.png")
-        print(f"    URL: {page.url}")
+        # If we already got redirected past login, we're in
+        if "office.com" in url or "myapps" in url or "portal.azure" in url:
+            await page.screenshot(path=f"{ERRORS_DIR}/ms_already_logged_in.png")
+            print(f"[!] Already logged in! URL: {page.url}")
+            return
 
-        # Enter email
-        print(f"[4] Looking for email field...")
+        # === STEP 2: We have a code, enter it ===
+        if mfa_code:
+            print(f"[2] Have MFA code, looking for code input...")
+
+            # Check if we're on the MFA page or need to re-login
+            # Try to find the code input directly
+            try:
+                code_input = page.locator("input[type='tel'], input[name='otc'], input[type='text'][aria-label*='code'], input[placeholder*='Code'], input[id='iOttText']")
+                await code_input.wait_for(state="visible", timeout=10000)
+                print(f"[3] Found code input, entering code...")
+                await code_input.fill(mfa_code)
+                await asyncio.sleep(1)
+
+                # Click verify/submit
+                verify_btn = page.locator("input[type='submit'], button[type='submit']")
+                await verify_btn.click()
+                await asyncio.sleep(5)
+
+                await page.screenshot(path=f"{ERRORS_DIR}/ms_05_after_code.png")
+                print(f"[4] Screenshot saved: ms_05_after_code.png")
+                print(f"    URL: {page.url}")
+
+            except PlaywrightTimeout:
+                # Maybe we need to go through email/password again
+                print(f"[!] No code input found. May need to re-login first.")
+                await page.screenshot(path=f"{ERRORS_DIR}/ms_05_no_code_input.png")
+                print(f"    URL: {page.url}")
+
+                # Try email field
+                try:
+                    email_input = page.locator("input[type='email'], input[name='loginfmt']")
+                    if await email_input.count() > 0 and await email_input.is_visible():
+                        print(f"[5] On login page, entering email...")
+                        await email_input.fill(email)
+                        await page.locator("input[type='submit']").click()
+                        await asyncio.sleep(3)
+
+                        pw_input = page.locator("input[type='password'], input[name='passwd']")
+                        await pw_input.wait_for(state="visible", timeout=10000)
+                        await pw_input.type(password, delay=50)
+                        await page.locator("input[type='submit']").click()
+                        await asyncio.sleep(5)
+
+                        # Now look for code input again
+                        code_input = page.locator("input[type='tel'], input[name='otc'], input[type='text'][aria-label*='code'], input[placeholder*='Code'], input[id='iOttText']")
+                        await code_input.wait_for(state="visible", timeout=10000)
+                        await code_input.fill(mfa_code)
+                        await page.locator("input[type='submit']").click()
+                        await asyncio.sleep(5)
+
+                        await page.screenshot(path=f"{ERRORS_DIR}/ms_05_after_code.png")
+                        print(f"[6] Screenshot: ms_05_after_code.png")
+                except Exception as e:
+                    print(f"[!] Re-login attempt failed: {e}")
+
+            # Handle "Stay signed in?" prompt
+            try:
+                await asyncio.sleep(2)
+                stay_btn = page.locator("input[type='submit'][value='Yes'], button:has-text('Yes')")
+                if await stay_btn.count() > 0 and await stay_btn.first.is_visible():
+                    print(f"[7] 'Stay signed in?' - clicking Yes...")
+                    await stay_btn.first.click()
+                    await asyncio.sleep(3)
+            except Exception:
+                pass
+
+            await page.screenshot(path=f"{ERRORS_DIR}/ms_06_final.png")
+            print(f"[8] Final screenshot: ms_06_final.png")
+            print(f"    Final URL: {page.url}")
+
+            url = page.url.lower()
+            if "office.com" in url or "myapps" in url:
+                print(f"\n[RESULT] SUCCESS - Logged into Microsoft!")
+            elif "salesforce" in url:
+                print(f"\n[RESULT] SUCCESS - Redirected to Salesforce!")
+            else:
+                print(f"\n[RESULT] Ended at: {url}")
+            return
+
+        # === STEP 1: Login and trigger MFA code send ===
+        print(f"[2] Looking for email field...")
         try:
             email_input = page.locator("input[type='email'], input[name='loginfmt']")
             await email_input.wait_for(state="visible", timeout=10000)
             await email_input.fill(email)
-            print(f"    Filled email: {email}")
-
-            # Click Next
-            next_btn = page.locator("input[type='submit'], button[type='submit']")
-            await next_btn.click()
+            await page.locator("input[type='submit']").click()
             await asyncio.sleep(3)
-
-            await page.screenshot(path=f"{ERRORS_DIR}/ms_02_after_email.png")
-            print(f"[5] Screenshot saved: ms_02_after_email.png")
-            print(f"    URL: {page.url}")
-
         except PlaywrightTimeout:
-            await page.screenshot(path=f"{ERRORS_DIR}/ms_02_email_timeout.png")
-            print(f"[!] Email field not found. Screenshot saved.")
-            print(f"    URL: {page.url}")
+            await page.screenshot(path=f"{ERRORS_DIR}/ms_step1_no_email.png")
+            print(f"[!] No email field. URL: {page.url}")
             return
 
-        # Enter password
-        print(f"[6] Looking for password field...")
+        print(f"[3] Entering password...")
         try:
             pw_input = page.locator("input[type='password'], input[name='passwd']")
             await pw_input.wait_for(state="visible", timeout=10000)
             await pw_input.type(password, delay=50)
-            print(f"    Filled password ({len(password)} chars)")
-
-            # Click Sign In
-            sign_in_btn = page.locator("input[type='submit'], button[type='submit']")
-            await sign_in_btn.click()
+            await page.locator("input[type='submit']").click()
             await asyncio.sleep(5)
-
-            await page.screenshot(path=f"{ERRORS_DIR}/ms_03_after_password.png")
-            print(f"[7] Screenshot saved: ms_03_after_password.png")
-            print(f"    URL: {page.url}")
-
         except PlaywrightTimeout:
-            await page.screenshot(path=f"{ERRORS_DIR}/ms_03_password_timeout.png")
-            print(f"[!] Password field not found. Screenshot saved.")
-            print(f"    URL: {page.url}")
+            await page.screenshot(path=f"{ERRORS_DIR}/ms_step1_no_password.png")
+            print(f"[!] No password field. URL: {page.url}")
             return
 
-        # Check for "Stay signed in?" prompt
+        await page.screenshot(path=f"{ERRORS_DIR}/ms_step1_after_password.png")
+        print(f"[4] After password. URL: {page.url}")
+
+        # Click first "Send a code" option
+        print(f"[5] Looking for 'Send a code' option...")
         try:
-            stay_signed_in = page.locator("input[type='submit'][value='Yes'], button:has-text('Yes')")
-            if await stay_signed_in.count() > 0:
-                print(f"[8] 'Stay signed in?' prompt detected, clicking Yes...")
-                await stay_signed_in.first.click()
-                await asyncio.sleep(3)
-        except Exception:
-            pass
+            # Try clicking the first send-code option
+            send_code_btn = page.locator("[data-value='OneWaySMS'], [data-value='Email'], div[role='button']:has-text('Send a code'), button:has-text('Send a code'), div:has-text('Send a code to pa')")
+            if await send_code_btn.count() > 0:
+                await send_code_btn.first.click()
+                await asyncio.sleep(5)
+                await page.screenshot(path=f"{ERRORS_DIR}/ms_step1_code_sent.png")
+                print(f"[6] Clicked send code. Screenshot: ms_step1_code_sent.png")
+                print(f"    URL: {page.url}")
+            else:
+                # Try a broader selector
+                all_options = page.locator("div[data-testid='proofOption']")
+                count = await all_options.count()
+                print(f"    Found {count} proof options")
+                if count > 0:
+                    await all_options.first.click()
+                    await asyncio.sleep(5)
+                    await page.screenshot(path=f"{ERRORS_DIR}/ms_step1_code_sent.png")
+                    print(f"[6] Clicked first option. Screenshot: ms_step1_code_sent.png")
+                else:
+                    print(f"[!] No send-code options found")
+                    await page.screenshot(path=f"{ERRORS_DIR}/ms_step1_no_options.png")
+        except Exception as e:
+            print(f"[!] Error clicking send code: {e}")
+            await page.screenshot(path=f"{ERRORS_DIR}/ms_step1_error.png")
 
-        # Check for MFA prompt
-        await page.screenshot(path=f"{ERRORS_DIR}/ms_04_final.png")
-        print(f"[8] Final screenshot saved: ms_04_final.png")
-        print(f"    Final URL: {page.url}")
-
-        # Determine result
-        url = page.url.lower()
-        if "microsoftonline" in url and ("kmsi" in url or "login" in url):
-            print(f"\n[RESULT] Still on Microsoft login - may need MFA or got blocked")
-        elif "myapps" in url or "office" in url or "portal" in url:
-            print(f"\n[RESULT] SUCCESS - logged into Microsoft!")
-        elif "salesforce" in url:
-            print(f"\n[RESULT] SUCCESS - redirected to Salesforce!")
-        else:
-            print(f"\n[RESULT] Ended up at: {url}")
+        print(f"\n[WAITING] Check your email for the code, then run:")
+        print(f"  python test_microsoft_login.py '{email}' '{password}' <CODE>")
 
     except Exception as e:
         await page.screenshot(path=f"{ERRORS_DIR}/ms_error.png")
         print(f"\n[ERROR] {e}")
-        print(f"    URL: {page.url}")
-
     finally:
         await context.close()
         await pw.stop()
@@ -121,6 +187,7 @@ async def test_ms_login(email: str, password: str):
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python test_microsoft_login.py <email> <password>")
+        print("Usage: python test_microsoft_login.py <email> <password> [mfa_code]")
         sys.exit(1)
-    asyncio.run(test_ms_login(sys.argv[1], sys.argv[2]))
+    code = sys.argv[3] if len(sys.argv) > 3 else None
+    asyncio.run(test_ms_login(sys.argv[1], sys.argv[2], code))
