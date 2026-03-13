@@ -438,8 +438,15 @@ class SalesforceBot:
                     mfa_code_callback=None, verification_email: str | None = None) -> bool:
         log.info("Logging in as %s", username)
 
-        # Always navigate fresh to the login page to avoid stale state
-        await self.page.goto(self.instance_url, wait_until="domcontentloaded")
+        # Use login.salesforce.com for standard orgs - it properly establishes
+        # session cookies and redirects to the user's org domain.
+        # For custom domains (like BSci's MS SSO), use the instance_url directly.
+        login_url = self.instance_url
+        if ".my.salesforce.com" in self.instance_url or ".lightning.force.com" in self.instance_url:
+            login_url = "https://login.salesforce.com"
+            log.info("Using login.salesforce.com for standard SF login")
+
+        await self.page.goto(login_url, wait_until="domcontentloaded")
         await asyncio.sleep(3)
 
         # Detect Microsoft SSO redirect
