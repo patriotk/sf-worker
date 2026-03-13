@@ -515,6 +515,18 @@ class SalesforceBot:
 
         log.info("Post-login URL: %s", self.page.url)
 
+        # Take a screenshot to debug login state
+        await self._screenshot("post_login_state")
+
+        # Check if there's an identity verification page
+        try:
+            verify_heading = self.page.locator("text='Verify Your Identity'")
+            if await verify_heading.count() > 0:
+                log.warning("Identity verification required - SF is challenging this login")
+                await self._screenshot("identity_verification")
+        except Exception:
+            pass
+
         # Try to navigate to Lightning to establish the Lightning session
         if not await self._is_on_lightning():
             log.info("Not on Lightning yet, navigating to Lightning home...")
@@ -522,6 +534,7 @@ class SalesforceBot:
             await self.page.goto(f"{base_url}/lightning/page/home", wait_until="networkidle", timeout=30000)
             await asyncio.sleep(5)
             log.info("After Lightning navigation: %s", self.page.url)
+            await self._screenshot("post_lightning_nav")
 
         log.info("Login successful")
         return True
