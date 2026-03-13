@@ -62,13 +62,14 @@ def _build_retry_payload(error: str, retry_count: int) -> dict:
 # --- Entry operations ---
 
 async def get_next_sending_entry() -> dict | None:
-    """Fetch the oldest unclaimed entry with status='sending' and retry_count < MAX_RETRIES."""
+    """Fetch the oldest unclaimed direct_push entry with status='sending'."""
     try:
         result = (
             _get_client()
             .table("crm_entries")
             .select("*")
             .eq("status", "sending")
+            .eq("send_method", "direct_push")
             .is_("processing_started_at", "null")
             .lt("retry_count", config.MAX_RETRIES)
             .order("created_at")
