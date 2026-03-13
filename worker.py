@@ -15,7 +15,7 @@ from supabase_client import (
     get_next_sending_entry, claim_entry, mark_sent, mark_failed,
     mark_retry, decrypt_entry, get_user_sf_profile, get_sf_credentials,
     update_profile_session, reset_stuck_entries, get_profiles_needing_setup,
-    save_org_layout, get_mfa_code,
+    save_org_layout, get_mfa_code, clear_mfa_code,
 )
 from browser import SalesforceBot
 from mapper import map_to_salesforce
@@ -123,12 +123,15 @@ async def process_entry(entry: dict):
         # Ensure logged in
         if not await bot.ensure_logged_in():
             sf_user, sf_pass = get_sf_credentials(profile)
-            logged_in = await bot.login(sf_user, sf_pass)
+            async def mfa_callback():
+                return await get_mfa_code(profile["id"])
+            logged_in = await bot.login(sf_user, sf_pass, mfa_code_callback=mfa_callback)
             del sf_pass
             if not logged_in:
                 await update_profile_session(profile["id"], valid=False, needs_mfa=True)
                 await mark_failed(entry_id, "Salesforce login failed. MFA may be required.", retry_count + 1)
                 return
+            await clear_mfa_code(profile["id"])
 
         # Resolve contact URL
         contact_url = await bot.search_and_resolve_contact(contact_name)
@@ -261,6 +264,9 @@ async def setup_profile(profile: dict):
                 return
         else:
             del sf_pass
+
+        # Login succeeded — clear MFA code if one was used
+        await clear_mfa_code(profile["id"])
 
         layout = await bot.scrape_org_layout()
         await save_org_layout(profile["id"], layout)

@@ -156,7 +156,7 @@ async def save_org_layout(profile_id: str, layout: dict):
 
 
 async def get_mfa_code(profile_id: str) -> str | None:
-    """Read mfa_code from user_sf_profiles. Returns None if not set."""
+    """Read mfa_code from user_sf_profiles. Does NOT clear it — caller clears after successful use."""
     result = (
         _get_client()
         .table("user_sf_profiles")
@@ -165,13 +165,14 @@ async def get_mfa_code(profile_id: str) -> str | None:
         .single()
         .execute()
     )
-    code = result.data.get("mfa_code") if result.data else None
-    if code:
-        # Clear it after reading so it's one-time use
-        _get_client().table("user_sf_profiles").update({
-            "mfa_code": None,
-        }).eq("id", profile_id).execute()
-    return code
+    return result.data.get("mfa_code") if result.data else None
+
+
+async def clear_mfa_code(profile_id: str):
+    """Clear mfa_code after successful MFA login."""
+    _get_client().table("user_sf_profiles").update({
+        "mfa_code": None,
+    }).eq("id", profile_id).execute()
 
 
 async def get_profiles_needing_setup() -> list[dict]:
