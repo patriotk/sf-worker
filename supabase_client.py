@@ -62,13 +62,14 @@ def _build_retry_payload(error: str, retry_count: int) -> dict:
 # --- Entry operations ---
 
 async def get_next_sending_entry() -> dict | None:
-    """Fetch the oldest entry with status='sending' and retry_count < MAX_RETRIES."""
+    """Fetch the oldest unclaimed entry with status='sending' and retry_count < MAX_RETRIES."""
     try:
         result = (
             _get_client()
             .table("crm_entries")
             .select("*")
             .eq("status", "sending")
+            .is_("processing_started_at", "null")
             .lt("retry_count", config.MAX_RETRIES)
             .order("created_at")
             .limit(1)
@@ -82,11 +83,22 @@ async def get_next_sending_entry() -> dict | None:
         return None
 
 
-async def claim_entry(entry_id: str):
-    """Mark entry as being processed (set processing_started_at)."""
-    _get_client().table("crm_entries").update(
-        _build_claim_payload()
-    ).eq("id", entry_id).execute()
+async def claim_entry(entry_id: str) -> bool:
+    """Atomically claim entry by setting processing_started_at only if still null.
+    Returns True if claimed, False if already claimed by another worker."""
+    result = (
+        _get_client()
+        .table("crm_entries")
+        .update(_build_claim_payload())
+        .eq("id", entry_id)
+        .is_("processing_started_at", "null")
+        .execute()
+    )
+    # If no rows were updated, another worker already claimed it
+    claimed = bool(result.data)
+    if not claimed:
+        log.info("Entry %s already claimed by another worker, skipping", entry_id)
+    return claimed
 
 
 async def mark_sent(entry_id: str):

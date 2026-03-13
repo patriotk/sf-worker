@@ -564,9 +564,28 @@ class SalesforceBot:
         return False
 
     async def ensure_logged_in(self) -> bool:
-        """Navigate to Salesforce and verify we're logged in. Login if needed."""
+        """Check if we're logged into Salesforce. Tries current page first, then navigates."""
         log.info("Checking session...")
-        await self.page.goto(f"{self.instance_url}/lightning/page/home", wait_until="domcontentloaded")
+
+        # Check current URL first -- if already on Lightning, we're good
+        current_url = self.page.url
+        if "lightning" in current_url and "login" not in current_url.lower():
+            try:
+                await self.page.wait_for_selector(
+                    "button:has-text('Search'), nav[aria-label='Main'], one-app-nav-bar", timeout=10000
+                )
+                log.info("Session active -- already on Lightning")
+                return True
+            except PlaywrightTimeout:
+                log.info("On Lightning URL but elements not found, will navigate to verify")
+
+        # Navigate to home to verify session
+        try:
+            await self.page.goto(f"{self.instance_url}/lightning/page/home", wait_until="domcontentloaded")
+        except Exception as e:
+            log.warning("Navigation failed: %s, retrying...", e)
+            await asyncio.sleep(2)
+            await self.page.goto(f"{self.instance_url}/lightning/page/home", wait_until="domcontentloaded")
         await asyncio.sleep(3)
 
         if await self._is_on_login_page():

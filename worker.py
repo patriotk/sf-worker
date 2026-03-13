@@ -180,8 +180,10 @@ async def poll_loop():
 
             entry = await get_next_sending_entry()
             if entry:
+                claimed = await claim_entry(entry["id"])
+                if not claimed:
+                    continue  # Another worker/iteration got it first
                 log.info("Claimed entry %s (retry %d)", entry["id"], entry.get("retry_count", 0))
-                await claim_entry(entry["id"])
                 asyncio.create_task(process_entry(entry))
 
         except Exception as e:
