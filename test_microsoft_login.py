@@ -33,8 +33,8 @@ async def test_ms_login(email: str, password: str, mfa_code: str = None):
         await asyncio.sleep(3)
         url = page.url.lower()
 
-        # If we already got redirected past login, we're in
-        if "office.com" in url or "myapps" in url or "portal.azure" in url:
+        # If we got redirected to Office/etc, we're already logged in
+        if ("office.com/landing" in url or "myapps" in url or "portal.azure" in url) and "login" not in url:
             await page.screenshot(path=f"{ERRORS_DIR}/ms_already_logged_in.png")
             print(f"[!] Already logged in! URL: {page.url}")
             return
