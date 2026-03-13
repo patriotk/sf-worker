@@ -1486,14 +1486,36 @@ class SalesforceBot:
     # SCRAPE ORG LAYOUT
     # ──────────────────────────────────────────────
 
+    async def _ensure_lightning_page(self) -> bool:
+        """After a goto, verify we're on Lightning (not redirected to login).
+        Returns True if on Lightning, False if stuck on login."""
+        await asyncio.sleep(2)
+        url = self.page.url.lower()
+        if self._is_on_login_page():
+            log.warning("Redirected to login page during scrape, session may not be ready")
+            # Try navigating to home first to establish session
+            await self.page.goto(f"{self.instance_url}/lightning/page/home", wait_until="domcontentloaded")
+            await asyncio.sleep(5)
+            if self._is_on_login_page():
+                return False
+        return True
+
     async def scrape_org_layout(self) -> dict:
         log.info("Scraping org layout...")
         layout = {"log_a_call": {}, "contacts": {}, "accounts": {}}
+
+        # First, ensure we're actually on a Lightning page
+        if not await self._ensure_lightning_page():
+            log.error("Cannot scrape: not logged in to Salesforce")
+            return layout
 
         # Log a Call
         try:
             await self.page.goto(f"{self.instance_url}/lightning/o/Contact/list", wait_until="domcontentloaded")
             await asyncio.sleep(3)
+            if self._is_on_login_page():
+                log.warning("Redirected to login during contact list scrape, skipping log_a_call")
+                raise Exception("Login redirect")
             first = self.page.locator("a[data-refid='recordId']").first
             if await first.count() > 0:
                 await first.click()
@@ -1539,6 +1561,9 @@ class SalesforceBot:
         try:
             await self.page.goto(f"{self.instance_url}/lightning/o/Contact/new", wait_until="domcontentloaded")
             await asyncio.sleep(3)
+            if self._is_on_login_page():
+                log.warning("Redirected to login during contact new scrape, skipping contacts")
+                raise Exception("Login redirect")
             labels = self.page.locator("label:visible")
             fields = []
             for i in range(await labels.count()):
