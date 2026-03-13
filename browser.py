@@ -118,6 +118,9 @@ class SalesforceBot:
         url = self.page.url.lower()
         if "login.salesforce" in url or "/login" in url:
             return True
+        # Microsoft SSO pages are also login pages
+        if "login.microsoftonline.com" in url or "login.live.com" in url:
+            return True
         # Also check for login form elements on the page
         try:
             username_field = self.page.locator("#username")
@@ -404,13 +407,34 @@ class SalesforceBot:
     # Authentication
     # ──────────────────────────────────────────────
 
-    async def login(self, username: str, password: str, mfa_code: str | None = None, mfa_code_callback=None) -> bool:
+    def _is_ms_sso_page(self) -> bool:
+        """Check if current page is a Microsoft SSO login page."""
+        url = self.page.url.lower()
+        return "login.microsoftonline.com" in url or "login.live.com" in url
+
+    async def login(self, username: str, password: str, mfa_code: str | None = None,
+                    mfa_code_callback=None, verification_email: str | None = None) -> bool:
         log.info("Logging in as %s", username)
 
         # Always navigate fresh to the login page to avoid stale state
         await self.page.goto(self.instance_url, wait_until="domcontentloaded")
         await asyncio.sleep(3)
 
+        # Detect Microsoft SSO redirect
+        if self._is_ms_sso_page():
+            log.info("Microsoft SSO detected, handling MS login flow")
+            return await self._login_microsoft_sso(
+                username, password,
+                mfa_code_callback=mfa_code_callback,
+                verification_email=verification_email,
+            )
+
+        # Standard Salesforce login
+        return await self._login_salesforce_direct(username, password, mfa_code, mfa_code_callback)
+
+    async def _login_salesforce_direct(self, username: str, password: str,
+                                        mfa_code: str | None = None, mfa_code_callback=None) -> bool:
+        """Standard Salesforce login (username/password on login.salesforce.com)."""
         # Handle identity confirmation page (username pre-filled + hidden)
         username_el = self.page.locator("#username")
         password_el = self.page.locator("#password")
@@ -469,6 +493,240 @@ class SalesforceBot:
 
         log.info("Login successful")
         return True
+
+    async def _login_microsoft_sso(self, username: str, password: str,
+                                    mfa_code_callback=None,
+                                    verification_email: str | None = None) -> bool:
+        """Handle Microsoft SSO (Azure AD SAML2) login flow.
+
+        Flow: email → password → MFA option selection → verification email → 6-digit code
+        The persistent browser profile should retain the MS session after first login,
+        so subsequent logins may skip MFA entirely.
+        """
+        try:
+            # Step 1: Email
+            log.info("[MS SSO] Entering email...")
+            email_input = self.page.locator("input[type='email'], input[name='loginfmt']")
+            await email_input.wait_for(state="visible", timeout=15000)
+            await email_input.fill(username)
+            await self.page.locator(
+                "input[type='submit'], button:has-text('Next')"
+            ).first.click()
+            await asyncio.sleep(4)
+
+            # Step 2: Password
+            log.info("[MS SSO] Entering password...")
+            pw_input = self.page.locator("input[type='password'], input[name='passwd']")
+            await pw_input.wait_for(state="visible", timeout=15000)
+            await pw_input.type(password, delay=50)
+            await self.page.locator(
+                "input[type='submit'], button:has-text('Next'), button:has-text('Sign in')"
+            ).first.click()
+            await asyncio.sleep(6)
+
+            # Check if we landed on Salesforce already (no MFA required)
+            if await self._check_ms_sso_complete():
+                return True
+
+            # Step 3: MFA option selection (if present)
+            # Microsoft shows verification options like "Send a code to pa***@liquidsmarts.com"
+            # or an authenticator app option. We look for the email/SMS code option.
+            mfa_option_clicked = False
+            for selector in [
+                "div[data-value='OneWaySMS']",
+                "div[data-value='Email']",
+                "div[role='button']:has-text('Send a code')",
+                "div:has-text('Send a code to')",
+            ]:
+                try:
+                    opt = self.page.locator(selector)
+                    if await opt.count() > 0 and await opt.first.is_visible():
+                        await opt.first.click(force=True)
+                        log.info("[MS SSO] Clicked MFA option: %s", selector)
+                        mfa_option_clicked = True
+                        await asyncio.sleep(5)
+                        break
+                except Exception:
+                    continue
+
+            # If there's a specific org option to click (e.g. "liquidsmarts")
+            if not mfa_option_clicked:
+                try:
+                    # Some SSO flows show org selection
+                    org_options = self.page.locator("div[role='button'], div.table")
+                    count = await org_options.count()
+                    if count > 0:
+                        await org_options.first.click(force=True)
+                        log.info("[MS SSO] Clicked first org option")
+                        await asyncio.sleep(5)
+                except Exception:
+                    pass
+
+            # Check again if we're through
+            if await self._check_ms_sso_complete():
+                return True
+
+            # Step 4: Verification email (if MS asks for email to send code to)
+            try:
+                verify_input = self.page.locator(
+                    "input[type='email']:visible, input[name='EmailAddress']:visible, "
+                    "input[placeholder*='email']:visible"
+                )
+                if await verify_input.count() > 0 and await verify_input.first.is_visible():
+                    email_to_use = verification_email or username
+                    log.info("[MS SSO] Filling verification email: %s", email_to_use)
+                    await verify_input.first.click()
+                    await verify_input.first.fill(email_to_use)
+                    await asyncio.sleep(1)
+
+                    # Click "Send code"
+                    send_btn = self.page.locator(
+                        "button:has-text('Send code'), input[value='Send code'], "
+                        "input[type='submit']:has-text('Send')"
+                    )
+                    if await send_btn.count() > 0:
+                        await send_btn.first.click()
+                        log.info("[MS SSO] Clicked Send code")
+                        await asyncio.sleep(5)
+            except Exception as e:
+                log.info("[MS SSO] No verification email step: %s", e)
+
+            # Check again
+            if await self._check_ms_sso_complete():
+                return True
+
+            # Step 5: Enter 6-digit MFA code (poll via callback)
+            log.info("[MS SSO] Waiting for MFA code...")
+            await self._screenshot("ms_sso_waiting_for_code")
+
+            code = None
+            for i in range(60):  # Poll up to 5 minutes
+                if mfa_code_callback:
+                    code = await mfa_code_callback()
+
+                if code:
+                    log.info("[MS SSO] Got MFA code, entering...")
+                    entered = await self._enter_ms_mfa_code(code)
+                    if entered:
+                        await asyncio.sleep(5)
+                        if await self._check_ms_sso_complete():
+                            return True
+                        # Code might have been wrong, try again
+                        log.warning("[MS SSO] Code entry didn't complete login, will retry")
+                    code = None
+
+                await asyncio.sleep(5)
+                if await self._check_ms_sso_complete():
+                    return True
+                if i % 4 == 3:
+                    log.info("[MS SSO] Still waiting for MFA code... (%ds)", (i + 1) * 5)
+
+            log.error("[MS SSO] MFA timeout (5 minutes)")
+            await self._screenshot("ms_sso_mfa_timeout")
+            return False
+
+        except Exception as e:
+            log.error("[MS SSO] Login failed: %s", e)
+            await self._screenshot("ms_sso_error")
+            return False
+
+    async def _enter_ms_mfa_code(self, code: str) -> bool:
+        """Enter a 6-digit MFA code on Microsoft's verification page.
+        Handles both individual digit boxes and single-input code fields.
+        """
+        # Try individual digit boxes first (Microsoft's default for 6-digit codes)
+        code_boxes = self.page.locator(
+            "input[type='tel'], input[maxlength='1'], "
+            "input[aria-label*='digit'], input[autocomplete='one-time-code']"
+        )
+        count = await code_boxes.count()
+
+        if count >= 6:
+            log.info("[MS SSO] Found %d code boxes, typing digit by digit", count)
+            await code_boxes.first.click()
+            await asyncio.sleep(0.5)
+            for digit in code:
+                await self.page.keyboard.type(digit, delay=100)
+                await asyncio.sleep(0.3)
+        else:
+            # Try single input field (otc, tel, or named code field)
+            single_input = self.page.locator(
+                "input[name='otc'], input#iOttText, input[type='tel'], "
+                "input[placeholder*='Code'], input[placeholder*='code']"
+            )
+            if await single_input.count() > 0 and await single_input.first.is_visible():
+                log.info("[MS SSO] Found single code input, filling")
+                await single_input.first.fill(code)
+            else:
+                # Fallback: type code via keyboard on whatever is focused
+                log.info("[MS SSO] No code input found, typing via keyboard")
+                await self.page.keyboard.type(code, delay=150)
+
+        await asyncio.sleep(1)
+
+        # Click verify/submit button
+        for btn_sel in [
+            "button:has-text('Verify')", "input[type='submit']",
+            "button[type='submit']", "input[value='Verify']",
+        ]:
+            try:
+                btn = self.page.locator(btn_sel)
+                if await btn.count() > 0 and await btn.first.is_visible():
+                    await btn.first.click()
+                    log.info("[MS SSO] Clicked verify: %s", btn_sel)
+                    return True
+            except Exception:
+                continue
+
+        log.warning("[MS SSO] No verify button found (may auto-submit)")
+        return True
+
+    async def _check_ms_sso_complete(self) -> bool:
+        """Check if Microsoft SSO flow completed and we're back on Salesforce/Office."""
+        url = self.page.url.lower()
+
+        # Check for "Stay signed in?" prompt and click Yes
+        try:
+            stay_btn = self.page.locator(
+                "input[type='submit'][value='Yes'], button:has-text('Yes'), "
+                "input[value='Yes']"
+            )
+            if await stay_btn.count() > 0 and await stay_btn.first.is_visible():
+                # Also check "Don't show this again"
+                try:
+                    dont_show = self.page.locator(
+                        "input[type='checkbox']:near(:text('Don\\'t show')), "
+                        "input#KmsOptions"
+                    )
+                    if await dont_show.count() > 0:
+                        await dont_show.first.check()
+                except Exception:
+                    pass
+                await stay_btn.first.click()
+                log.info("[MS SSO] Clicked 'Stay signed in: Yes'")
+                await asyncio.sleep(3)
+                url = self.page.url.lower()
+        except Exception:
+            pass
+
+        # Success conditions: landed on Salesforce Lightning
+        if "lightning" in url and "login" not in url:
+            log.info("[MS SSO] Login complete -- on Salesforce Lightning")
+            return True
+
+        # Still on MS login pages
+        if "login.microsoftonline.com" in url or "login.live.com" in url:
+            return False
+
+        # On Office/M365 (shouldn't happen for SF SSO, but handle it)
+        if "office.com" in url or "m365.cloud.microsoft" in url:
+            log.info("[MS SSO] Landed on Office, navigating to Salesforce...")
+            await self.page.goto(self.instance_url, wait_until="domcontentloaded")
+            await asyncio.sleep(5)
+            return "lightning" in self.page.url.lower()
+
+        # Other URL -- might be a redirect in progress
+        return False
 
     async def _handle_mfa(self, mfa_code: str | None = None, mfa_code_callback=None) -> bool | None:
         """Handle MFA verification. If mfa_code is provided, auto-enter it.
@@ -578,6 +836,11 @@ class SalesforceBot:
                 return True
             except PlaywrightTimeout:
                 log.info("On Lightning URL but elements not found, will navigate to verify")
+
+        # If on Microsoft SSO page, session is expired
+        if self._is_ms_sso_page():
+            log.info("On Microsoft SSO page -- session expired, need re-login")
+            return False
 
         # Navigate to home to verify session
         try:

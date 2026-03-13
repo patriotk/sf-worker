@@ -125,7 +125,11 @@ async def process_entry(entry: dict):
             sf_user, sf_pass = get_sf_credentials(profile)
             async def mfa_callback():
                 return await get_mfa_code(profile["id"])
-            logged_in = await bot.login(sf_user, sf_pass, mfa_code_callback=mfa_callback)
+            logged_in = await bot.login(
+                sf_user, sf_pass,
+                mfa_code_callback=mfa_callback,
+                verification_email=profile.get("verification_email"),
+            )
             del sf_pass
             if not logged_in:
                 await update_profile_session(profile["id"], valid=False, needs_mfa=True)
@@ -250,7 +254,11 @@ async def setup_profile(profile: dict):
             async def mfa_callback():
                 return await get_mfa_code(profile["id"])
 
-            logged_in = await bot.login(sf_user, sf_pass, mfa_code_callback=mfa_callback)
+            logged_in = await bot.login(
+                sf_user, sf_pass,
+                mfa_code_callback=mfa_callback,
+                verification_email=profile.get("verification_email"),
+            )
             del sf_pass
             if not logged_in:
                 await update_profile_session(profile["id"], valid=False, needs_mfa=True)
